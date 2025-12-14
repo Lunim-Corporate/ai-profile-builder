@@ -2,6 +2,7 @@
 
 AI-powered profile builder that transforms any creative professional's online presence into a comprehensive, verified portfolio.
 Now integrated into tabb.
+LINK:https://profile-automator-tabb.replit.app
 
 ## Features
 
