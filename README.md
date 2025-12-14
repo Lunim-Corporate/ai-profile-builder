@@ -1,6 +1,7 @@
 # Profile Automator
 
 AI-powered profile builder that transforms any creative professional's online presence into a comprehensive, verified portfolio.
+Now integrated into tabb.
 
 ## Features
 
