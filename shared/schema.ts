@@ -53,6 +53,16 @@ export const projectSchema = z.object({
 });
 export type Project = z.infer<typeof projectSchema>;
 
+export const apiCapabilitiesSchema = z.object({
+  perplexity: z.boolean(),
+  gemini: z.boolean(),
+  tmdb: z.boolean(),
+  youtube: z.boolean(),
+  vimeo: z.boolean(),
+  omdb: z.boolean(),
+});
+export type ApiCapabilities = z.infer<typeof apiCapabilitiesSchema>;
+
 // Media item type
 export const mediaItemSchema = z.object({
   id: z.string(),
@@ -82,8 +92,24 @@ export const profileSchema = z.object({
   media: z.array(mediaItemSchema),
   crawledData: z.record(z.unknown()).optional(),
   createdAt: z.string(),
+  /** Present on generate responses: which integrations had credentials at request time. */
+  apiCapabilities: apiCapabilitiesSchema.optional(),
 });
 export type Profile = z.infer<typeof profileSchema>;
+
+/** Result of POST /api/profiles/generate — explicit outcome for the UI. */
+export type ProfileGenerationStatus = "success" | "partial" | "failed";
+
+export type GenerateProfileResponse =
+  | {
+      status: "success" | "partial";
+      profile: Profile;
+    }
+  | {
+      status: "failed";
+      message?: string;
+      apiCapabilities?: ApiCapabilities;
+    };
 
 // Input schema for profile generation request
 export const generateProfileRequestSchema = z.object({

@@ -1,3 +1,5 @@
+import "./load-env";
+import { validateEnvForStartup } from "./env";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
@@ -60,6 +62,7 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  validateEnvForStartup();
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {

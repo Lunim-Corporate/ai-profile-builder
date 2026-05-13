@@ -8,9 +8,12 @@ import MediaGallery from "@/components/MediaGallery";
 import LoadingState from "@/components/LoadingState";
 import ThemeToggle from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
-import { ArrowUp, Sparkles, AlertCircle } from "lucide-react";
+import { ArrowUp, Sparkles } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
-import type { Profile } from "@shared/schema";
+import type { Profile, GenerateProfileResponse } from "@shared/schema";
+
+const AUTOFILL_FAILED_MESSAGE =
+  "We couldn't autofill from that link — try a different URL, paste your text, or fill in your profile manually.";
 
 const floatingOrbs = [
   { size: 300, x: "10%", y: "20%", delay: 0, color: "hsl(217 91% 60% / 0.3)" },
@@ -19,7 +22,7 @@ const floatingOrbs = [
   { size: 180, x: "20%", y: "70%", delay: 6, color: "hsl(280 65% 60% / 0.2)" },
 ];
 
-type AppState = "input" | "loading" | "profile" | "error";
+type AppState = "input" | "loading" | "profile";
 type LoadingStage = "crawling" | "aggregating" | "synthesizing" | "building";
 
 export default function Home() {
@@ -32,16 +35,33 @@ export default function Home() {
   const generateMutation = useMutation({
     mutationFn: async (url: string) => {
       const response = await apiRequest("POST", "/api/profiles/generate", { url });
-      return response.json() as Promise<Profile>;
+      // Server may return wrapped `{ status, profile }` or legacy bare `Profile`.
+      return response.json() as Promise<GenerateProfileResponse | Profile>;
     },
     onSuccess: (data) => {
-      setProfile(data);
+      if ("status" in data && data.status === "failed") {
+        setErrorMessage(data.message?.trim() || AUTOFILL_FAILED_MESSAGE);
+        setAppState("input");
+        return;
+      }
+      const profile: Profile | null =
+        "profile" in data && data.profile
+          ? data.profile
+          : "id" in data && "urlHash" in data
+            ? (data as Profile)
+            : null;
+      if (!profile) {
+        setErrorMessage(AUTOFILL_FAILED_MESSAGE);
+        setAppState("input");
+        return;
+      }
+      setProfile(profile);
       setAppState("profile");
     },
     onError: (error) => {
       console.error("Generation failed:", error);
       setErrorMessage(error instanceof Error ? error.message : "Failed to generate profile");
-      setAppState("error");
+      setAppState("input");
     },
   });
 
@@ -120,7 +140,7 @@ export default function Home() {
           </button>
           
           <div className="flex items-center gap-2">
-            {(appState === "profile" || appState === "error") && (
+            {appState === "profile" && (
               <Button 
                 variant="outline" 
                 size="sm" 
@@ -181,7 +201,12 @@ export default function Home() {
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.8, delay: 0.2, ease: "easeOut" }}
               >
-                <URLInputForm onSubmit={handleSubmit} isLoading={generateMutation.isPending} />
+                <URLInputForm
+                  onSubmit={handleSubmit}
+                  isLoading={generateMutation.isPending}
+                  serverError={errorMessage}
+                  onDismissServerError={() => setErrorMessage("")}
+                />
               </motion.div>
             </div>
           </div>
@@ -189,21 +214,6 @@ export default function Home() {
 
         {appState === "loading" && (
           <LoadingState stage={loadingStage} />
-        )}
-
-        {appState === "error" && (
-          <div className="py-20 md:py-32">
-            <div className="max-w-md mx-auto px-6 text-center">
-              <div className="w-16 h-16 rounded-full bg-destructive/10 flex items-center justify-center mx-auto mb-6">
-                <AlertCircle className="w-8 h-8 text-destructive" />
-              </div>
-              <h2 className="text-2xl font-display font-bold mb-2">Generation Failed</h2>
-              <p className="text-muted-foreground mb-6">{errorMessage || "Something went wrong. Please try again."}</p>
-              <Button onClick={handleReset} data-testid="button-try-again">
-                Try Again
-              </Button>
-            </div>
-          </div>
         )}
 
         {appState === "profile" && profile && (

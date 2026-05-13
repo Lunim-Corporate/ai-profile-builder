@@ -340,6 +340,24 @@ async function extractVideoUrlsWithPuppeteer(url: string): Promise<string[]> {
   return Array.from(new Set(videoUrls));
 }
 
+/**
+ * True when the crawler extracted enough real page content to justify building a profile.
+ * Failed HTTP crawls and empty SPAs yield false so we do not persist placeholder profiles.
+ */
+export function crawlHasUsableContent(data: CrawledData): boolean {
+  const text = data.textContent.trim();
+  const title = data.title?.trim() ?? "";
+  const desc = data.description?.trim() ?? "";
+
+  if (text.length >= 120) return true;
+  if (data.socialLinks.length > 0) return true;
+  if (data.images.length >= 1 && (text.length >= 40 || desc.length >= 40)) return true;
+  if (title.length >= 3 && (text.length >= 40 || desc.length >= 20)) return true;
+  if (data.links.length >= 5 && text.length >= 30) return true;
+
+  return false;
+}
+
 export async function crawlUrl(url: string): Promise<CrawledData> {
   try {
     const response = await axios.get(url, {

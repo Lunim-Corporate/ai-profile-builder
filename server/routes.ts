@@ -3,13 +3,32 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { randomUUID } from "crypto";
 import { generateProfileRequestSchema } from "@shared/schema";
-import type { Profile } from "@shared/schema";
-import { crawlUrl, normalizeUrl, hashUrl } from "./services/crawler";
+import type { Profile, SynthesisResult, CrawledData, ProfileGenerationStatus, Platform, MediaItem } from "@shared/schema";
+import { crawlUrl, crawlHasUsableContent, normalizeUrl, hashUrl } from "./services/crawler";
 import { searchWithPerplexity } from "./services/perplexity";
 import { synthesizeProfile } from "./services/gemini";
 import { enrichProjectsWithPosters, searchPerson } from "./services/tmdb";
-import { fetchChannelVideos, formatYouTubeDate, searchYouTubeForProject } from "./services/youtube";
-import { getVimeoThumbnail, isVimeoUrl, fetchVimeoUserVideos, formatVimeoDate, VimeoVideo, searchVimeoForProject } from "./services/vimeo";
+import { fetchChannelVideos, searchYouTubeForProject } from "./services/youtube";
+import { getVimeoThumbnail, isVimeoUrl, fetchVimeoUserVideos, VimeoVideo, searchVimeoForProject } from "./services/vimeo";
+import { getApiCapabilities, getMissingRequiredEnvVars, isProfilePipelineDebugEnabled } from "./env";
+import { summarizeCrawledForDebug, logPipelineStage } from "./pipelineDebug";
+
+function classifyGeneration(
+  synthesis: SynthesisResult,
+  crawledData: CrawledData,
+): Exclude<ProfileGenerationStatus, "failed"> {
+  const nameBad = /^unknown$/i.test(synthesis.name.trim());
+  const thin =
+    synthesis.projects.length === 0 &&
+    synthesis.media.length === 0;
+  const shortCrawl = crawledData.textContent.trim().length < 100;
+
+  if (synthesis.confidence < 0.5) return "partial";
+  if (nameBad && thin) return "partial";
+  if (nameBad && shortCrawl) return "partial";
+
+  return "success";
+}
 
 export async function registerRoutes(
   httpServer: Server,
@@ -28,71 +47,204 @@ export async function registerRoutes(
         });
       }
 
+      const missingEnvVars = getMissingRequiredEnvVars();
+      if (missingEnvVars.length > 0) {
+        return res.status(503).json({
+          error: "Server is missing required API keys for profile generation.",
+          missingEnvVars,
+          capabilities: getApiCapabilities(),
+        });
+      }
+
       const { url } = parsed.data;
       const normalizedUrl = normalizeUrl(url);
       const urlHash = hashUrl(normalizedUrl);
+      const debugPipeline = isProfilePipelineDebugEnabled();
+      const timingsMs: Record<string, number> = {};
 
       // Check if we already have this profile cached
       const existingProfile = await storage.getProfileByUrlHash(urlHash);
       if (existingProfile) {
-        return res.json(existingProfile);
+        if (debugPipeline) {
+          logPipelineStage("CACHE HIT — skipped crawl / AI / APIs", {
+            normalizedUrl,
+            urlHash,
+            profileId: existingProfile.id,
+          });
+        }
+        return res.json({
+          status: "success" as const,
+          profile: {
+            ...existingProfile,
+            apiCapabilities: getApiCapabilities(),
+          },
+        });
       }
 
       // Step 1: Crawl the URL
       console.log("Crawling URL:", normalizedUrl);
+      const tCrawl = Date.now();
       const crawledData = await crawlUrl(normalizedUrl);
+      if (debugPipeline) timingsMs.crawl = Date.now() - tCrawl;
+
+      if (!crawlHasUsableContent(crawledData)) {
+        console.log("Crawl produced no usable content; skipping profile save");
+        if (debugPipeline) {
+          logPipelineStage("FAILED — crawl had no usable content", {
+            normalizedUrl,
+            urlHash,
+            timingsMs,
+            crawl: summarizeCrawledForDebug(crawledData),
+          });
+        }
+        return res.json({
+          status: "failed" as const,
+          message:
+            "We couldn't autofill from that link — try a different URL, paste your text, or fill in your profile manually.",
+          apiCapabilities: getApiCapabilities(),
+        });
+      }
+
+      if (debugPipeline) {
+        logPipelineStage("Step 1 — Crawl (usable content)", {
+          normalizedUrl,
+          urlHash,
+          crawlMs: timingsMs.crawl,
+          crawl: summarizeCrawledForDebug(crawledData),
+        });
+      }
 
       // Step 2: Enrich with Perplexity search
       console.log("Enriching with Perplexity...");
       const nameHint = crawledData.title?.split(/[-–|]/)[0].trim() || "";
-      const enrichmentData = await searchWithPerplexity(
-        nameHint,
-        crawledData.textContent
-      );
+      const tPerplexity = Date.now();
+      const { enrichment: enrichmentData, debug: perplexityDebug } =
+        await searchWithPerplexity(nameHint, crawledData.textContent, {
+          captureDebug: debugPipeline,
+        });
+      if (debugPipeline) timingsMs.perplexity = Date.now() - tPerplexity;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 2 — Perplexity", {
+          nameHint,
+          perplexityMs: timingsMs.perplexity,
+          enrichment: {
+            success: enrichmentData.success,
+            additionalInfoLength: enrichmentData.additionalInfo.length,
+            additionalInfoPreview: enrichmentData.additionalInfo.slice(0, 2000),
+            projectsParsed: enrichmentData.projects,
+            collaboratorsParsed: enrichmentData.collaborators,
+          },
+          perplexityApi: perplexityDebug ?? null,
+        });
+      }
 
       // Step 3: Synthesize with Gemini
       console.log("Synthesizing with Gemini...");
-      const synthesisResult = await synthesizeProfile(crawledData, enrichmentData);
+      const tGemini = Date.now();
+      const { synthesis: synthesisResult, debug: geminiDebug } = await synthesizeProfile(
+        crawledData,
+        enrichmentData,
+        { captureDebug: debugPipeline },
+      );
+      if (debugPipeline) timingsMs.gemini = Date.now() - tGemini;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 3 — Gemini synthesis", {
+          geminiMs: timingsMs.gemini,
+          synthesis: synthesisResult,
+          geminiApi: geminiDebug ?? null,
+        });
+      }
 
       // Step 4: Enrich projects with TMDB posters
       console.log("Enriching with TMDB posters...");
+      const tTmdbPosters = Date.now();
       const enrichedProjects = await enrichProjectsWithPosters(synthesisResult.projects);
+      if (debugPipeline) timingsMs.tmdbPosters = Date.now() - tTmdbPosters;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 4 — TMDB project posters", {
+          tmdbPostersMs: timingsMs.tmdbPosters,
+          projectCount: enrichedProjects.length,
+          projectsWithCoverAfterTmdb: enrichedProjects.filter((p) => Boolean(p.coverImage)).length,
+          projects: enrichedProjects.map((p) => ({
+            id: p.id,
+            title: p.title,
+            year: p.year,
+            hasCover: Boolean(p.coverImage),
+          })),
+        });
+      }
 
       // Step 5: Fetch YouTube videos if channel URL exists
       console.log("Fetching YouTube videos...");
       let mediaItems = [...synthesisResult.media];
       let youtubeVideos: { url: string; title: string; thumbnail: string; publishedAt: string }[] = [];
       const youtubeLink = crawledData.socialLinks.find(l => l.platform === 'youtube');
+      const tYoutube = Date.now();
       if (youtubeLink) {
         youtubeVideos = await fetchChannelVideos(youtubeLink.url);
-        const videoMedia = youtubeVideos.map(video => ({
-          type: "video" as const,
+        const videoMedia: MediaItem[] = youtubeVideos.map((video) => ({
+          id: randomUUID(),
           url: video.url,
           title: video.title,
           thumbnail: video.thumbnail,
-          date: formatYouTubeDate(video.publishedAt),
+          platform: "youtube",
         }));
         mediaItems = [...videoMedia, ...mediaItems.filter(m => !m.url.includes('youtube.com'))];
+      }
+      if (debugPipeline) timingsMs.youtubeChannelMs = Date.now() - tYoutube;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 5 — YouTube channel fetch", {
+          youtubeChannelMs: timingsMs.youtubeChannelMs,
+          socialLinkFound: Boolean(youtubeLink),
+          channelUrl: youtubeLink?.url ?? null,
+          videosFetched: youtubeVideos.length,
+          videos: youtubeVideos.map((v) => ({
+            title: v.title,
+            url: v.url,
+            publishedAt: v.publishedAt,
+          })),
+        });
       }
 
       // Step 5b: Fetch Vimeo videos if channel URL exists
       console.log("Fetching Vimeo videos...");
       let vimeoVideos: VimeoVideo[] = [];
       const vimeoLink = crawledData.socialLinks.find(l => l.platform === 'vimeo');
+      const tVimeo = Date.now();
       if (vimeoLink) {
         vimeoVideos = await fetchVimeoUserVideos(vimeoLink.url);
-        const vimeoMedia = vimeoVideos.map(video => ({
-          type: "video" as const,
+        const vimeoMedia: MediaItem[] = vimeoVideos.map((video) => ({
+          id: randomUUID(),
           url: video.url,
           title: video.title,
           thumbnail: video.thumbnail,
-          date: formatVimeoDate(video.createdAt),
+          platform: "vimeo",
         }));
         mediaItems = [...mediaItems, ...vimeoMedia.filter(vm => !mediaItems.some(m => m.url === vm.url))];
+      }
+      if (debugPipeline) timingsMs.vimeoChannelMs = Date.now() - tVimeo;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 6 — Vimeo channel fetch", {
+          vimeoChannelMs: timingsMs.vimeoChannelMs,
+          socialLinkFound: Boolean(vimeoLink),
+          channelUrl: vimeoLink?.url ?? null,
+          videosFetched: vimeoVideos.length,
+          videos: vimeoVideos.map((v) => ({
+            title: v.title,
+            url: v.url,
+            createdAt: v.createdAt,
+          })),
+        });
       }
 
       // Step 6: Enrich projects with YouTube/Vimeo thumbnails as fallback cover images
       console.log("Enriching projects with video thumbnails...");
+      const tThumbPass = Date.now();
       const finalProjects = await Promise.all(enrichedProjects.map(async (project) => {
         if (project.coverImage) return project;
         
@@ -147,9 +299,19 @@ export async function registerRoutes(
         
         return project;
       }));
+      if (debugPipeline) timingsMs.projectThumbnailPassMs = Date.now() - tThumbPass;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 7 — Project cover thumbnails (YouTube/Vimeo/oEmbed)", {
+          projectThumbnailPassMs: timingsMs.projectThumbnailPassMs,
+          projectCount: finalProjects.length,
+          coversPresent: finalProjects.filter((p) => Boolean(p.coverImage)).length,
+        });
+      }
 
       // Step 6b: Enrich projects with video URLs (trailers for movies/shows, full videos for shorts)
       console.log("Searching for video URLs on YouTube/Vimeo...");
+      const tVideoSearch = Date.now();
       const projectsWithVideos = await Promise.all(finalProjects.map(async (project) => {
         // Skip if project already has a video URL
         if (project.videoUrl) {
@@ -225,15 +387,31 @@ export async function registerRoutes(
         
         return project;
       }));
+      if (debugPipeline) timingsMs.projectVideoSearchMs = Date.now() - tVideoSearch;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 8 — Project video URLs (channel match + YouTube/Vimeo search)", {
+          projectVideoSearchMs: timingsMs.projectVideoSearchMs,
+          projects: projectsWithVideos.map((p) => ({
+            id: p.id,
+            title: p.title,
+            videoUrl: p.videoUrl ?? null,
+            hasVideo: Boolean(p.hasVideo || p.videoUrl),
+          })),
+        });
+      }
 
       // Step 7: Find person's profile image from TMDB
       console.log("Searching for person profile image...");
       let profileImageUrl: string | undefined = undefined;
+      let usedTmdbHeadshot = false;
+      const tPerson = Date.now();
       
       if (synthesisResult.name) {
         const tmdbPersonImage = await searchPerson(synthesisResult.name);
         if (tmdbPersonImage) {
           profileImageUrl = tmdbPersonImage;
+          usedTmdbHeadshot = true;
           console.log(`Using TMDB person image for ${synthesisResult.name}`);
         }
       }
@@ -243,12 +421,23 @@ export async function registerRoutes(
         profileImageUrl = crawledData.images[0];
         console.log("Using crawled image as fallback");
       }
+      if (debugPipeline) timingsMs.tmdbPersonImageMs = Date.now() - tPerson;
+
+      if (debugPipeline) {
+        logPipelineStage("Step 9 — Headshot (TMDB person search + crawl fallback)", {
+          tmdbPersonImageMs: timingsMs.tmdbPersonImageMs,
+          searchedName: synthesisResult.name,
+          usedTmdbPersonImage: usedTmdbHeadshot,
+          resolvedImageUrl: profileImageUrl ?? null,
+        });
+      }
 
       // Step 8: Build the final profile
       // Only use platforms that we actually found links for (from crawled social links)
-      const actualPlatforms = crawledData.socialLinks.length > 0
-        ? Array.from(new Set(crawledData.socialLinks.map(link => link.platform)))
-        : ["website"]; // Default to just website if no social links found
+      const actualPlatforms: Platform[] =
+        crawledData.socialLinks.length > 0
+          ? Array.from(new Set(crawledData.socialLinks.map((link) => link.platform)))
+          : ["website"];
 
       const profile: Profile = {
         id: randomUUID(),
@@ -273,13 +462,35 @@ export async function registerRoutes(
           imageCount: crawledData.images.length,
         },
         createdAt: new Date().toISOString(),
+        apiCapabilities: getApiCapabilities(),
       };
 
       // Store the profile
       await storage.createProfile(profile);
 
-      console.log("Profile created:", profile.id);
-      return res.json(profile);
+      const generationStatus = classifyGeneration(synthesisResult, crawledData);
+      console.log("Profile created:", profile.id, "generationStatus:", generationStatus);
+
+      if (debugPipeline) {
+        logPipelineStage("DONE — timings + final profile summary", {
+          profileId: profile.id,
+          generationStatus,
+          timingsMs,
+          mediaCount: mediaItems.length,
+          profileSummary: {
+            name: profile.name,
+            role: profile.role,
+            confidence: profile.confidence,
+            projectCount: profile.projectCount,
+            platforms: profile.platforms,
+          },
+        });
+      }
+
+      return res.json({
+        status: generationStatus,
+        profile,
+      });
     } catch (error) {
       console.error("Profile generation error:", error);
       return res.status(500).json({ 
@@ -298,7 +509,10 @@ export async function registerRoutes(
         return res.status(404).json({ error: "Profile not found" });
       }
 
-      return res.json(profile);
+      return res.json({
+        ...profile,
+        apiCapabilities: getApiCapabilities(),
+      });
     } catch (error) {
       console.error("Get profile error:", error);
       return res.status(500).json({ error: "Failed to get profile" });

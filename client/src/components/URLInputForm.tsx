@@ -2,14 +2,22 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Link, Loader2, Video, ArrowRight } from "lucide-react";
+import { Link, Loader2, Video, ArrowRight, AlertCircle } from "lucide-react";
 
 interface URLInputFormProps {
   onSubmit: (url: string) => void;
   isLoading?: boolean;
+  /** Shown below the title when generation fails — keeps user on this card. */
+  serverError?: string;
+  onDismissServerError?: () => void;
 }
 
-export default function URLInputForm({ onSubmit, isLoading = false }: URLInputFormProps) {
+export default function URLInputForm({
+  onSubmit,
+  isLoading = false,
+  serverError,
+  onDismissServerError,
+}: URLInputFormProps) {
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
 
@@ -57,7 +65,17 @@ export default function URLInputForm({ onSubmit, isLoading = false }: URLInputFo
           Transform your portfolio into a stunning professional profile
         </CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-4">
+        {serverError ? (
+          <div
+            role="alert"
+            className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-left text-sm text-foreground"
+            data-testid="banner-generation-error"
+          >
+            <AlertCircle className="h-5 w-5 shrink-0 text-destructive mt-0.5" aria-hidden />
+            <p className="leading-relaxed">{serverError}</p>
+          </div>
+        ) : null}
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="relative">
             <div className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground">
@@ -70,6 +88,7 @@ export default function URLInputForm({ onSubmit, isLoading = false }: URLInputFo
               onChange={(e) => {
                 setUrl(e.target.value);
                 setError("");
+                onDismissServerError?.();
               }}
               className="pl-11 h-12 text-base"
               disabled={isLoading}

@@ -1,7 +1,10 @@
 import { GoogleGenAI } from "@google/genai";
 import type { SynthesisResult, CrawledData, Platform, Project, MediaItem } from "@shared/schema";
+import { truncateForDebug } from "../pipelineDebug";
 
 const platformTypes = ["imdb", "tmdb", "omdb", "youtube", "vimeo", "linkedin", "facebook", "website"] as const;
+
+const GEMINI_MODEL = "gemini-2.5-flash";
 
 interface EnrichmentData {
   additionalInfo: string;
@@ -14,28 +17,22 @@ interface EnrichmentData {
   collaborators: string[];
 }
 
-export async function synthesizeProfile(
-  crawledData: CrawledData,
-  enrichmentData: EnrichmentData
-): Promise<SynthesisResult> {
-  // Use Replit AI Integrations (preferred) or fallback to user's API key
-  const apiKey = process.env.AI_INTEGRATIONS_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
-  const baseUrl = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
-  
-  if (!apiKey) {
-    console.warn("No Gemini API key configured, using fallback synthesis");
-    return createFallbackProfile(crawledData, enrichmentData);
-  }
+export type GeminiSynthesisDebug = {
+  model: string;
+  path:
+    | "gemini"
+    | "fallback_no_api_key"
+    | "fallback_empty_response"
+    | "fallback_json_parse"
+    | "fallback_exception";
+  prompt: string;
+  rawResponseText: string;
+  parseError?: string;
+  exceptionMessage?: string;
+};
 
-  try {
-    console.log("Gemini API available, attempting synthesis...");
-    // Using Replit AI Integrations - requires apiVersion: "" for compatibility
-    const ai = new GoogleGenAI({ 
-      apiKey,
-      httpOptions: baseUrl ? { apiVersion: "", baseUrl } : undefined
-    });
-
-    const prompt = `Analyze the following data about a creative professional and synthesize a unified profile.
+function buildSynthesisPrompt(crawledData: CrawledData, enrichmentData: EnrichmentData): string {
+  return `Analyze the following data about a creative professional and synthesize a unified profile.
 
 CRAWLED DATA FROM THEIR WEBSITE:
 Title: ${crawledData.title || "Unknown"}
@@ -90,16 +87,50 @@ Please synthesize this information and respond with a JSON object containing:
 
 If you cannot determine certain information, use reasonable defaults and lower the confidence score.
 Respond ONLY with valid JSON, no markdown formatting.`;
+}
+
+export async function synthesizeProfile(
+  crawledData: CrawledData,
+  enrichmentData: EnrichmentData,
+  options?: { captureDebug?: boolean },
+): Promise<{ synthesis: SynthesisResult; debug?: GeminiSynthesisDebug }> {
+  const capture = options?.captureDebug === true;
+  const prompt = buildSynthesisPrompt(crawledData, enrichmentData);
+  const promptForDebug = truncateForDebug(prompt, 100_000);
+
+  const apiKey = process.env.AI_INTEGRATIONS_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+  const baseUrl = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
+
+  if (!apiKey) {
+    console.warn("No Gemini API key configured, using fallback synthesis");
+    return {
+      synthesis: createFallbackProfile(crawledData, enrichmentData),
+      ...(capture && {
+        debug: {
+          model: GEMINI_MODEL,
+          path: "fallback_no_api_key",
+          prompt: promptForDebug,
+          rawResponseText: "",
+        },
+      }),
+    };
+  }
+
+  try {
+    console.log("Gemini API available, attempting synthesis...");
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: baseUrl ? { apiVersion: "", baseUrl } : undefined,
+    });
 
     const usingReplitAI = !!process.env.AI_INTEGRATIONS_GEMINI_API_KEY;
-    console.log(`Calling Gemini API (${usingReplitAI ? 'Replit AI' : 'user key'}) with model gemini-2.5-flash...`);
+    console.log(`Calling Gemini API (${usingReplitAI ? "Replit AI" : "user key"}) with model ${GEMINI_MODEL}...`);
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_MODEL,
       contents: prompt,
     });
     console.log("Gemini API responded");
 
-    // Extract text from response - handle both direct text property and candidates structure
     let text = "";
     if (typeof response.text === "string") {
       text = response.text;
@@ -108,16 +139,25 @@ Respond ONLY with valid JSON, no markdown formatting.`;
       text = response.candidates[0].content.parts[0].text;
       console.log("Extracted text from response.candidates structure");
     }
-    
+
     if (!text) {
       console.warn("Gemini returned empty response, using fallback");
       console.log("Response structure:", JSON.stringify(response, null, 2).substring(0, 500));
-      return createFallbackProfile(crawledData, enrichmentData);
+      return {
+        synthesis: createFallbackProfile(crawledData, enrichmentData),
+        ...(capture && {
+          debug: {
+            model: GEMINI_MODEL,
+            path: "fallback_empty_response",
+            prompt: promptForDebug,
+            rawResponseText: "",
+          },
+        }),
+      };
     }
-    
+
     console.log("Gemini synthesis successful, parsing JSON response...");
-    
-    // Clean up the response - remove markdown code blocks if present
+
     let jsonText = text.trim();
     if (jsonText.startsWith("```json")) {
       jsonText = jsonText.slice(7);
@@ -130,50 +170,95 @@ Respond ONLY with valid JSON, no markdown formatting.`;
     }
     jsonText = jsonText.trim();
 
-    // Try to extract valid JSON from the response
     let parsed: any;
     try {
       parsed = JSON.parse(jsonText);
     } catch (e) {
       console.log("Initial JSON parse failed, attempting to fix...");
-      // Try to find JSON object boundaries
-      const startBrace = jsonText.indexOf('{');
-      const endBrace = jsonText.lastIndexOf('}');
+      const startBrace = jsonText.indexOf("{");
+      const endBrace = jsonText.lastIndexOf("}");
       if (startBrace !== -1 && endBrace > startBrace) {
         jsonText = jsonText.slice(startBrace, endBrace + 1);
         try {
           parsed = JSON.parse(jsonText);
         } catch (e2) {
-          // Try fixing common issues: unescaped quotes, trailing commas
-          jsonText = jsonText
-            .replace(/,\s*}/g, '}')
-            .replace(/,\s*]/g, ']')
-            .replace(/:\s*"([^"]*)"([^",}\]]*)"([^"]*)":/g, ': "$1\\"$2\\"$3":');
-          parsed = JSON.parse(jsonText);
+          try {
+            jsonText = jsonText
+              .replace(/,\s*}/g, "}")
+              .replace(/,\s*]/g, "]")
+              .replace(/:\s*"([^"]*)"([^",}\]]*)"([^"]*)":/g, ': "$1\\"$2\\"$3":');
+            parsed = JSON.parse(jsonText);
+          } catch (e3) {
+            const parseError =
+              e3 instanceof Error ? e3.message : e instanceof Error ? e.message : String(e3);
+            return {
+              synthesis: createFallbackProfile(crawledData, enrichmentData),
+              ...(capture && {
+                debug: {
+                  model: GEMINI_MODEL,
+                  path: "fallback_json_parse",
+                  prompt: promptForDebug,
+                  rawResponseText: truncateForDebug(text, 100_000),
+                  parseError,
+                },
+              }),
+            };
+          }
         }
       } else {
-        throw e;
+        const parseError = e instanceof Error ? e.message : String(e);
+        return {
+          synthesis: createFallbackProfile(crawledData, enrichmentData),
+          ...(capture && {
+            debug: {
+              model: GEMINI_MODEL,
+              path: "fallback_json_parse",
+              prompt: promptForDebug,
+              rawResponseText: truncateForDebug(text, 100_000),
+              parseError,
+            },
+          }),
+        };
       }
     }
-    
-    // Validate and normalize the response
-    return normalizeProfile(parsed, crawledData);
+
+    return {
+      synthesis: normalizeProfile(parsed, crawledData),
+      ...(capture && {
+        debug: {
+          model: GEMINI_MODEL,
+          path: "gemini",
+          prompt: promptForDebug,
+          rawResponseText: truncateForDebug(text, 100_000),
+        },
+      }),
+    };
   } catch (error) {
     console.error("Gemini synthesis error:", error);
     if (error instanceof Error) {
       console.error("Error message:", error.message);
       console.error("Error stack:", error.stack);
     }
-    return createFallbackProfile(crawledData, enrichmentData);
+    const exceptionMessage = error instanceof Error ? error.message : String(error);
+    return {
+      synthesis: createFallbackProfile(crawledData, enrichmentData),
+      ...(capture && {
+        debug: {
+          model: GEMINI_MODEL,
+          path: "fallback_exception",
+          prompt: promptForDebug,
+          rawResponseText: "",
+          exceptionMessage,
+        },
+      }),
+    };
   }
 }
 
 function normalizeProfile(parsed: any, crawledData: CrawledData): SynthesisResult {
   const validPlatforms = (platforms: any[]): Platform[] => {
     if (!Array.isArray(platforms)) return ["website"];
-    return platforms.filter((p): p is Platform => 
-      platformTypes.includes(p as Platform)
-    );
+    return platforms.filter((p): p is Platform => platformTypes.includes(p as Platform));
   };
 
   const normalizedProjects: Project[] = (parsed.projects || []).map((p: any, i: number) => ({
@@ -190,14 +275,16 @@ function normalizeProfile(parsed: any, crawledData: CrawledData): SynthesisResul
     sourceUrl: p.sourceUrl ? String(p.sourceUrl) : undefined,
   }));
 
-  const normalizedMedia: MediaItem[] = (parsed.media || []).map((m: any, i: number) => ({
-    id: m.id || `media-${i}`,
-    url: String(m.url || ""),
-    title: String(m.title || "Untitled"),
-    description: m.description ? String(m.description) : undefined,
-    platform: platformTypes.includes(m.platform) ? m.platform : "youtube",
-    thumbnail: undefined,
-  })).filter((m: MediaItem) => m.url);
+  const normalizedMedia: MediaItem[] = (parsed.media || [])
+    .map((m: any, i: number) => ({
+      id: m.id || `media-${i}`,
+      url: String(m.url || ""),
+      title: String(m.title || "Untitled"),
+      description: m.description ? String(m.description) : undefined,
+      platform: platformTypes.includes(m.platform) ? m.platform : "youtube",
+      thumbnail: undefined,
+    }))
+    .filter((m: MediaItem) => m.url);
 
   return {
     name: String(parsed.name || crawledData.title || "Unknown"),
@@ -213,12 +300,10 @@ function normalizeProfile(parsed: any, crawledData: CrawledData): SynthesisResul
 
 function createFallbackProfile(
   crawledData: CrawledData,
-  enrichmentData: EnrichmentData
+  enrichmentData: EnrichmentData,
 ): SynthesisResult {
-  // Extract name from title or metadata
   const name = crawledData.title?.split(/[-–|]/)[0].trim() || "Unknown";
-  
-  // Create projects from enrichment data
+
   const projects: Project[] = enrichmentData.projects.map((p, i) => ({
     id: `project-${i}`,
     title: p.title,
@@ -229,8 +314,7 @@ function createFallbackProfile(
     hasVideo: false,
   }));
 
-  // Extract platforms from social links
-  const platforms: Platform[] = crawledData.socialLinks.map(l => l.platform);
+  const platforms: Platform[] = crawledData.socialLinks.map((l) => l.platform);
   if (!platforms.includes("website")) {
     platforms.push("website");
   }
