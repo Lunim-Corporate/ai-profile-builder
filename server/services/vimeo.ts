@@ -1,4 +1,5 @@
 import axios from "axios";
+import type { CrawledData } from "@shared/schema";
 
 export interface VimeoVideo {
   id: string;
@@ -45,6 +46,68 @@ export function extractVimeoUsername(url: string): string | null {
     }
   }
   return null;
+}
+
+/** Build CrawledData from Vimeo API for user profile URLs. */
+export async function fetchVimeoUserForCrawl(vimeoUrl: string): Promise<CrawledData | null> {
+  const apiKey = process.env.VIMEO_API_KEY;
+  if (!apiKey) {
+    console.warn("VIMEO_API_KEY not configured, skipping Vimeo platform crawl");
+    return null;
+  }
+
+  const username = extractVimeoUsername(vimeoUrl);
+  if (!username) {
+    return null;
+  }
+
+  try {
+    const userResponse = await axios.get(
+      `https://api.vimeo.com/users/${username}`,
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+      },
+    );
+
+    const user = userResponse.data;
+    const name = user.name || username;
+    const bio = (user.bio || "").trim();
+    const link = user.link || `https://vimeo.com/${username}`;
+    const thumbnail =
+      user.pictures?.sizes?.[3]?.link ||
+      user.pictures?.sizes?.[2]?.link ||
+      user.pictures?.sizes?.[1]?.link ||
+      null;
+
+    const videos = await fetchVimeoUserVideos(vimeoUrl);
+    const videoLines = videos
+      .slice(0, 20)
+      .map((v) => `${v.title} (${formatVimeoDate(v.createdAt)}) — ${v.url}`);
+
+    const textParts = [
+      bio,
+      videoLines.length > 0 ? `Recent videos:\n${videoLines.join("\n")}` : "",
+    ].filter(Boolean);
+
+    return {
+      url: vimeoUrl,
+      title: name,
+      description: bio.slice(0, 500) || undefined,
+      images: thumbnail ? [thumbnail] : [],
+      links: videos.map((v) => v.url),
+      socialLinks: [{ platform: "vimeo", url: link }],
+      textContent: textParts.join("\n\n").slice(0, 10000),
+      metadata: { _crawlSource: "vimeo_api", vimeo_username: username },
+      videoUrls: videos.map((v) => v.url),
+    };
+  } catch (error: unknown) {
+    console.error("Vimeo platform crawl error:", error);
+    return null;
+  }
 }
 
 export async function fetchVimeoUserVideos(vimeoUrl: string): Promise<VimeoVideo[]> {

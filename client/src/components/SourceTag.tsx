@@ -14,6 +14,8 @@ const platformNames: Record<Platform, string> = {
   vimeo: "Vimeo",
   linkedin: "LinkedIn",
   facebook: "Facebook",
+  twitter: "X / Twitter",
+  instagram: "Instagram",
   website: "Website",
 };
 

@@ -6,10 +6,22 @@ import {
   Linkedin, 
   Facebook,
   Database,
-  Globe
+  Globe,
+  Hash,
+  Camera,
 } from "lucide-react";
 
-export type Platform = "imdb" | "tmdb" | "omdb" | "youtube" | "vimeo" | "linkedin" | "facebook" | "website";
+export type Platform =
+  | "imdb"
+  | "tmdb"
+  | "omdb"
+  | "youtube"
+  | "vimeo"
+  | "linkedin"
+  | "facebook"
+  | "twitter"
+  | "instagram"
+  | "website";
 
 interface PlatformBadgeProps {
   platform: Platform;
@@ -24,6 +36,8 @@ const platformConfig: Record<Platform, { label: string; icon: typeof Film; bgCla
   vimeo: { label: "Vimeo", icon: Video, bgClass: "bg-blue-500/10 text-blue-600 dark:text-blue-400" },
   linkedin: { label: "LinkedIn", icon: Linkedin, bgClass: "bg-sky-500/10 text-sky-600 dark:text-sky-400" },
   facebook: { label: "Facebook", icon: Facebook, bgClass: "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400" },
+  twitter: { label: "X / Twitter", icon: Hash, bgClass: "bg-neutral-500/10 text-neutral-700 dark:text-neutral-300" },
+  instagram: { label: "Instagram", icon: Camera, bgClass: "bg-pink-500/10 text-pink-600 dark:text-pink-400" },
   website: { label: "Website", icon: Globe, bgClass: "bg-gray-500/10 text-gray-600 dark:text-gray-400" },
 };
 

@@ -1,4 +1,5 @@
 import axios from "axios";
+import type { CrawledData } from "@shared/schema";
 
 interface YouTubeVideo {
   id: string;
@@ -30,6 +31,114 @@ function extractChannelId(url: string): string | null {
     }
   }
   return null;
+}
+
+async function resolveChannelId(channelUrl: string, apiKey: string): Promise<{
+  channelId: string;
+  title: string;
+  description: string;
+  thumbnail: string | null;
+} | null> {
+  const channelIdentifier = extractChannelId(channelUrl);
+  if (!channelIdentifier) {
+    return null;
+  }
+
+  let channelId = channelIdentifier;
+
+  if (channelUrl.includes("/@") || channelUrl.includes("/c/") || channelUrl.includes("/user/")) {
+    const searchResponse = await axios.get(
+      `https://www.googleapis.com/youtube/v3/search`,
+      {
+        params: {
+          part: "snippet",
+          type: "channel",
+          q: channelIdentifier,
+          key: apiKey,
+          maxResults: 1,
+        },
+      },
+    );
+
+    if (!searchResponse.data.items?.length) {
+      return null;
+    }
+    channelId = searchResponse.data.items[0].id.channelId;
+  }
+
+  const channelResponse = await axios.get(
+    `https://www.googleapis.com/youtube/v3/channels`,
+    {
+      params: {
+        part: "snippet,contentDetails",
+        id: channelId,
+        key: apiKey,
+      },
+    },
+  );
+
+  if (!channelResponse.data.items?.length) {
+    return null;
+  }
+
+  const snippet = channelResponse.data.items[0].snippet;
+  return {
+    channelId,
+    title: snippet.title || "",
+    description: snippet.description || "",
+    thumbnail:
+      snippet.thumbnails?.high?.url ||
+      snippet.thumbnails?.medium?.url ||
+      snippet.thumbnails?.default?.url ||
+      null,
+  };
+}
+
+/** Build CrawledData from YouTube Data API for channel profile URLs. */
+export async function fetchYouTubeChannelForCrawl(channelUrl: string): Promise<CrawledData | null> {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) {
+    console.warn("YOUTUBE_API_KEY not configured, skipping YouTube platform crawl");
+    return null;
+  }
+
+  try {
+    const channel = await resolveChannelId(channelUrl, apiKey);
+    if (!channel) {
+      console.log("Could not resolve YouTube channel:", channelUrl);
+      return null;
+    }
+
+    const videos = await fetchChannelVideos(channelUrl);
+    const videoLines = videos
+      .slice(0, 20)
+      .map((v) => `${v.title} (${formatYouTubeDate(v.publishedAt)}) — ${v.url}`);
+
+    const canonicalUrl =
+      channelUrl.includes("/channel/") || channelUrl.includes("/@")
+        ? channelUrl
+        : `https://www.youtube.com/channel/${channel.channelId}`;
+
+    const textParts = [
+      channel.description.trim(),
+      videoLines.length > 0 ? `Recent videos:\n${videoLines.join("\n")}` : "",
+    ].filter(Boolean);
+
+    return {
+      url: channelUrl,
+      title: channel.title,
+      description: channel.description.slice(0, 500) || undefined,
+      images: channel.thumbnail ? [channel.thumbnail] : [],
+      links: videos.map((v) => v.url),
+      socialLinks: [{ platform: "youtube", url: canonicalUrl }],
+      textContent: textParts.join("\n\n").slice(0, 10000),
+      metadata: { _crawlSource: "youtube_api", youtube_channel_id: channel.channelId },
+      videoUrls: videos.map((v) => v.url),
+    };
+  } catch (error) {
+    console.error("YouTube platform crawl error:", error);
+    return null;
+  }
 }
 
 export async function fetchChannelVideos(channelUrl: string): Promise<YouTubeVideo[]> {

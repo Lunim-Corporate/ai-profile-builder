@@ -1,8 +1,13 @@
 import { GoogleGenAI } from "@google/genai";
-import type { SynthesisResult, CrawledData, Platform, Project, MediaItem } from "@shared/schema";
+import {
+  platformTypes,
+  type SynthesisResult,
+  type CrawledData,
+  type Platform,
+  type Project,
+  type MediaItem,
+} from "@shared/schema";
 import { truncateForDebug } from "../pipelineDebug";
-
-const platformTypes = ["imdb", "tmdb", "omdb", "youtube", "vimeo", "linkedin", "facebook", "website"] as const;
 
 const GEMINI_MODEL = "gemini-2.5-flash";
 

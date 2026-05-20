@@ -2,16 +2,48 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { randomUUID } from "crypto";
-import { generateProfileRequestSchema } from "@shared/schema";
+import {
+  generateProfileRequestSchema,
+  profileCorePatchSchema,
+  projectFieldsPatchSchema,
+  projectCreateSchema,
+  mediaItemPatchSchema,
+} from "@shared/schema";
 import type { Profile, SynthesisResult, CrawledData, ProfileGenerationStatus, Platform, MediaItem } from "@shared/schema";
 import { crawlUrl, crawlHasUsableContent, normalizeUrl, hashUrl } from "./services/crawler";
 import { searchWithPerplexity } from "./services/perplexity";
 import { synthesizeProfile } from "./services/gemini";
-import { enrichProjectsWithPosters, searchPerson } from "./services/tmdb";
+import { enrichProjectsWithPosters, lookupTmdbPerson } from "./services/tmdb";
 import { fetchChannelVideos, searchYouTubeForProject } from "./services/youtube";
 import { getVimeoThumbnail, isVimeoUrl, fetchVimeoUserVideos, VimeoVideo, searchVimeoForProject } from "./services/vimeo";
 import { getApiCapabilities, getMissingRequiredEnvVars, isProfilePipelineDebugEnabled } from "./env";
 import { summarizeCrawledForDebug, logPipelineStage } from "./pipelineDebug";
+import {
+  extractSocialLinksFromText,
+  mergeSocialLinks,
+  socialLinksFromProfileUrlRecord,
+} from "./services/socialLinksFromText";
+import { resolveResearchSubject } from "./services/researchSubject";
+
+const DEFAULT_CRAWL_FAIL_MESSAGE =
+  "We couldn't build a profile from that link. Try a different URL — for example an IMDb, TMDB, YouTube, or Vimeo profile page.";
+
+function messageForUnusableCrawl(crawled: CrawledData): string {
+  const code = crawled.metadata?._crawlFailure;
+  if (code === "cloudflare_bot_wall") {
+    return "That site blocked automated access (often Cloudflare), so we couldn't read the page. Try a public profile URL on IMDb, TMDB, YouTube, or Vimeo instead.";
+  }
+  if (code === "http_403" || code === "http_401") {
+    return "The server refused our request (access denied). Try another public profile URL — for example IMDb, TMDB, YouTube, or Vimeo.";
+  }
+  if (code === "http_5xx") {
+    return "The site returned a server error while we were fetching it. Try again later or use a different profile URL.";
+  }
+  if (code === "http_or_network") {
+    return "We couldn't reach that page. Check the URL and try again, or use a profile link on IMDb, TMDB, YouTube, or Vimeo.";
+  }
+  return DEFAULT_CRAWL_FAIL_MESSAGE;
+}
 
 function classifyGeneration(
   synthesis: SynthesisResult,
@@ -87,7 +119,30 @@ export async function registerRoutes(
       const crawledData = await crawlUrl(normalizedUrl);
       if (debugPipeline) timingsMs.crawl = Date.now() - tCrawl;
 
-      if (!crawlHasUsableContent(crawledData)) {
+      // #region agent log
+      const usable = crawlHasUsableContent(crawledData);
+      fetch("http://127.0.0.1:7719/ingest/5cba0bb0-af06-496e-b138-35094d7bb1e7", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "412af6" },
+        body: JSON.stringify({
+          sessionId: "412af6",
+          runId: "pre",
+          hypothesisId: "H4",
+          location: "routes.ts:generate:afterCrawl",
+          message: "crawl result gate",
+          data: {
+            usable,
+            textLen: crawledData.textContent.trim().length,
+            linkCount: crawledData.links.length,
+            imageCount: crawledData.images.length,
+            socialCount: crawledData.socialLinks.length,
+          },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
+
+      if (!usable) {
         console.log("Crawl produced no usable content; skipping profile save");
         if (debugPipeline) {
           logPipelineStage("FAILED — crawl had no usable content", {
@@ -99,8 +154,7 @@ export async function registerRoutes(
         }
         return res.json({
           status: "failed" as const,
-          message:
-            "We couldn't autofill from that link — try a different URL, paste your text, or fill in your profile manually.",
+          message: messageForUnusableCrawl(crawledData),
           apiCapabilities: getApiCapabilities(),
         });
       }
@@ -116,17 +170,27 @@ export async function registerRoutes(
 
       // Step 2: Enrich with Perplexity search
       console.log("Enriching with Perplexity...");
-      const nameHint = crawledData.title?.split(/[-–|]/)[0].trim() || "";
+      const subjectResolution = resolveResearchSubject(crawledData);
       const tPerplexity = Date.now();
       const { enrichment: enrichmentData, debug: perplexityDebug } =
-        await searchWithPerplexity(nameHint, crawledData.textContent, {
+        await searchWithPerplexity(subjectResolution, crawledData.textContent, {
           captureDebug: debugPipeline,
         });
       if (debugPipeline) timingsMs.perplexity = Date.now() - tPerplexity;
 
+      const socialFromJson = socialLinksFromProfileUrlRecord(
+        enrichmentData.structured?.profile_urls as Record<string, unknown> | undefined,
+      );
+      const socialFromProse = extractSocialLinksFromText(enrichmentData.additionalInfo);
+      const socialLinksFromResearch = mergeSocialLinks(socialFromJson, socialFromProse);
+      const crawlContext: CrawledData = {
+        ...crawledData,
+        socialLinks: mergeSocialLinks(crawledData.socialLinks, socialLinksFromResearch),
+      };
+
       if (debugPipeline) {
         logPipelineStage("Step 2 — Perplexity", {
-          nameHint,
+          subjectResolution,
           perplexityMs: timingsMs.perplexity,
           enrichment: {
             success: enrichmentData.success,
@@ -134,6 +198,10 @@ export async function registerRoutes(
             additionalInfoPreview: enrichmentData.additionalInfo.slice(0, 2000),
             projectsParsed: enrichmentData.projects,
             collaboratorsParsed: enrichmentData.collaborators,
+            perplexityStructured: enrichmentData.structured,
+            socialLinksFromProfileUrls: socialFromJson,
+            socialLinksFromProseUrls: socialFromProse,
+            socialLinksMergedFromResearch: socialLinksFromResearch,
           },
           perplexityApi: perplexityDebug ?? null,
         });
@@ -143,7 +211,7 @@ export async function registerRoutes(
       console.log("Synthesizing with Gemini...");
       const tGemini = Date.now();
       const { synthesis: synthesisResult, debug: geminiDebug } = await synthesizeProfile(
-        crawledData,
+        crawlContext,
         enrichmentData,
         { captureDebug: debugPipeline },
       );
@@ -181,7 +249,7 @@ export async function registerRoutes(
       console.log("Fetching YouTube videos...");
       let mediaItems = [...synthesisResult.media];
       let youtubeVideos: { url: string; title: string; thumbnail: string; publishedAt: string }[] = [];
-      const youtubeLink = crawledData.socialLinks.find(l => l.platform === 'youtube');
+      const youtubeLink = crawlContext.socialLinks.find(l => l.platform === 'youtube');
       const tYoutube = Date.now();
       if (youtubeLink) {
         youtubeVideos = await fetchChannelVideos(youtubeLink.url);
@@ -213,7 +281,7 @@ export async function registerRoutes(
       // Step 5b: Fetch Vimeo videos if channel URL exists
       console.log("Fetching Vimeo videos...");
       let vimeoVideos: VimeoVideo[] = [];
-      const vimeoLink = crawledData.socialLinks.find(l => l.platform === 'vimeo');
+      const vimeoLink = crawlContext.socialLinks.find(l => l.platform === 'vimeo');
       const tVimeo = Date.now();
       if (vimeoLink) {
         vimeoVideos = await fetchVimeoUserVideos(vimeoLink.url);
@@ -401,21 +469,26 @@ export async function registerRoutes(
         });
       }
 
-      // Step 7: Find person's profile image from TMDB
+      // Step 9: TMDB person — headshot + canonical IMDb/TMDB profile URLs (API, not crawl/Perplexity-only)
       console.log("Searching for person profile image...");
       let profileImageUrl: string | undefined = undefined;
       let usedTmdbHeadshot = false;
       const tPerson = Date.now();
-      
+
+      let socialLinksForProfile = crawlContext.socialLinks;
+
       if (synthesisResult.name) {
-        const tmdbPersonImage = await searchPerson(synthesisResult.name);
-        if (tmdbPersonImage) {
-          profileImageUrl = tmdbPersonImage;
+        const tmdbPerson = await lookupTmdbPerson(synthesisResult.name);
+        if (tmdbPerson?.imageUrl) {
+          profileImageUrl = tmdbPerson.imageUrl;
           usedTmdbHeadshot = true;
           console.log(`Using TMDB person image for ${synthesisResult.name}`);
         }
+        if (tmdbPerson?.socialLinks?.length) {
+          socialLinksForProfile = mergeSocialLinks(socialLinksForProfile, tmdbPerson.socialLinks);
+        }
       }
-      
+
       // Fallback to crawled image if no TMDB person image found
       if (!profileImageUrl && crawledData.images.length > 0) {
         profileImageUrl = crawledData.images[0];
@@ -429,14 +502,20 @@ export async function registerRoutes(
           searchedName: synthesisResult.name,
           usedTmdbPersonImage: usedTmdbHeadshot,
           resolvedImageUrl: profileImageUrl ?? null,
+          tmdbProfileSocialAugment:
+            socialLinksForProfile.length > crawlContext.socialLinks.length
+              ? socialLinksForProfile.filter(
+                  (l) => !crawlContext.socialLinks.some((c) => c.platform === l.platform && c.url === l.url),
+                )
+              : [],
         });
       }
 
-      // Step 8: Build the final profile
-      // Only use platforms that we actually found links for (from crawled social links)
+      // Step 10: Build the final profile
+      // Platforms / social links: crawl + Perplexity + TMDB canonical person URLs
       const actualPlatforms: Platform[] =
-        crawledData.socialLinks.length > 0
-          ? Array.from(new Set(crawledData.socialLinks.map((link) => link.platform)))
+        socialLinksForProfile.length > 0
+          ? Array.from(new Set(socialLinksForProfile.map((link) => link.platform)))
           : ["website"];
 
       const profile: Profile = {
@@ -450,9 +529,10 @@ export async function registerRoutes(
         projectCount: projectsWithVideos.length,
         yearsActive: synthesisResult.yearsActive,
         platforms: actualPlatforms,
-        socialLinks: crawledData.socialLinks.length > 0 
-          ? crawledData.socialLinks 
-          : [{ platform: "website" as const, url: normalizedUrl }],
+        socialLinks:
+          socialLinksForProfile.length > 0
+            ? socialLinksForProfile
+            : [{ platform: "website" as const, url: normalizedUrl }],
         confidence: synthesisResult.confidence,
         projects: projectsWithVideos,
         media: mediaItems,
@@ -552,6 +632,210 @@ export async function registerRoutes(
     } catch (error) {
       console.error("Update profile image error:", error);
       return res.status(500).json({ error: "Failed to update profile image" });
+    }
+  });
+
+  // Update profile headline fields + social links
+  app.patch("/api/profiles/:profileId", async (req, res) => {
+    try {
+      const parsed = profileCorePatchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "Invalid request",
+          details: parsed.error.flatten(),
+        });
+      }
+
+      const profile = await storage.getProfile(req.params.profileId);
+      if (!profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      const merged = { ...profile, ...parsed.data };
+      await storage.updateProfile(profile.id, merged);
+      return res.json({
+        ...merged,
+        apiCapabilities: getApiCapabilities(),
+      });
+    } catch (error) {
+      console.error("Update profile error:", error);
+      return res.status(500).json({ error: "Failed to update profile" });
+    }
+  });
+
+  // Add a project
+  app.post("/api/profiles/:profileId/projects", async (req, res) => {
+    try {
+      const parsed = projectCreateSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "Invalid request",
+          details: parsed.error.flatten(),
+        });
+      }
+
+      const profile = await storage.getProfile(req.params.profileId);
+      if (!profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      const d = parsed.data;
+      const newProject = {
+        id: randomUUID(),
+        title: d.title,
+        year: d.year?.trim() || "Unknown",
+        role: d.role?.trim() || "Creator",
+        platform: d.platform ?? "website",
+        description: d.description?.trim() || undefined,
+        sourceUrl: d.sourceUrl?.trim() || undefined,
+        videoUrl: d.videoUrl?.trim() || undefined,
+        coverImage: d.coverImage?.trim() || undefined,
+        collaborators: d.collaborators?.length ? d.collaborators : undefined,
+        hasVideo: d.hasVideo ?? Boolean(d.videoUrl?.trim()),
+      };
+
+      const projects = [...profile.projects, newProject];
+      const saved = await storage.updateProfile(profile.id, {
+        ...profile,
+        projects,
+        projectCount: projects.length,
+      });
+
+      if (!saved) {
+        return res.status(500).json({ error: "Failed to save profile" });
+      }
+
+      return res.status(201).json({
+        ...saved,
+        apiCapabilities: getApiCapabilities(),
+      });
+    } catch (error) {
+      console.error("Add project error:", error);
+      return res.status(500).json({ error: "Failed to add project" });
+    }
+  });
+
+  // Remove a project
+  app.delete("/api/profiles/:profileId/projects/:projectId", async (req, res) => {
+    try {
+      const profile = await storage.getProfile(req.params.profileId);
+      if (!profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      const projects = profile.projects.filter((p) => p.id !== req.params.projectId);
+      if (projects.length === profile.projects.length) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      const saved = await storage.updateProfile(profile.id, {
+        ...profile,
+        projects,
+        projectCount: projects.length,
+      });
+
+      if (!saved) {
+        return res.status(500).json({ error: "Failed to save profile" });
+      }
+
+      return res.json({
+        ...saved,
+        apiCapabilities: getApiCapabilities(),
+      });
+    } catch (error) {
+      console.error("Remove project error:", error);
+      return res.status(500).json({ error: "Failed to remove project" });
+    }
+  });
+
+  // Update one project (title, role, urls, etc.)
+  app.patch("/api/profiles/:profileId/projects/:projectId", async (req, res) => {
+    try {
+      const parsed = projectFieldsPatchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "Invalid request",
+          details: parsed.error.flatten(),
+        });
+      }
+
+      const profile = await storage.getProfile(req.params.profileId);
+      if (!profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      const idx = profile.projects.findIndex((p) => p.id === req.params.projectId);
+      if (idx === -1) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      const { id: _ignoredId, ...patchRest } = parsed.data;
+      const updatedProject = {
+        ...profile.projects[idx],
+        ...patchRest,
+        id: profile.projects[idx].id,
+      };
+      const projects = [...profile.projects];
+      projects[idx] = updatedProject;
+
+      await storage.updateProfile(profile.id, {
+        ...profile,
+        projects,
+        projectCount: projects.length,
+      });
+
+      return res.json({
+        ...updatedProject,
+        apiCapabilities: getApiCapabilities(),
+      });
+    } catch (error) {
+      console.error("Update project error:", error);
+      return res.status(500).json({ error: "Failed to update project" });
+    }
+  });
+
+  // Update one media item
+  app.patch("/api/profiles/:profileId/media/:mediaId", async (req, res) => {
+    try {
+      const parsed = mediaItemPatchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "Invalid request",
+          details: parsed.error.flatten(),
+        });
+      }
+
+      const profile = await storage.getProfile(req.params.profileId);
+      if (!profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      const idx = profile.media.findIndex((m) => m.id === req.params.mediaId);
+      if (idx === -1) {
+        return res.status(404).json({ error: "Media item not found" });
+      }
+
+      const { id: _ignoredMediaId, ...mediaPatch } = parsed.data;
+      const updatedMedia = {
+        ...profile.media[idx],
+        ...mediaPatch,
+        id: profile.media[idx].id,
+      };
+      const media = [...profile.media];
+      media[idx] = updatedMedia;
+
+      await storage.updateProfile(profile.id, {
+        ...profile,
+        media,
+      });
+
+      return res.json({
+        ...updatedMedia,
+        apiCapabilities: getApiCapabilities(),
+      });
+    } catch (error) {
+      console.error("Update media error:", error);
+      return res.status(500).json({ error: "Failed to update media item" });
     }
   });
 

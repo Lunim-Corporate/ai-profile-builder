@@ -8,12 +8,13 @@ import MediaGallery from "@/components/MediaGallery";
 import LoadingState from "@/components/LoadingState";
 import ThemeToggle from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import { ArrowUp, Sparkles } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
-import type { Profile, GenerateProfileResponse } from "@shared/schema";
+import type { Profile, GenerateProfileResponse, MediaItem } from "@shared/schema";
 
 const AUTOFILL_FAILED_MESSAGE =
-  "We couldn't autofill from that link — try a different URL, paste your text, or fill in your profile manually.";
+  "We couldn't build a profile from that link. Try a different URL — for example an IMDb, TMDB, YouTube, or Vimeo profile page.";
 
 const floatingOrbs = [
   { size: 300, x: "10%", y: "20%", delay: 0, color: "hsl(217 91% 60% / 0.3)" },
@@ -31,6 +32,7 @@ export default function Home() {
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
+  const [footerNote, setFooterNote] = useState("");
 
   const generateMutation = useMutation({
     mutationFn: async (url: string) => {
@@ -113,9 +115,39 @@ export default function Home() {
     });
   };
 
+  const handleProfileUpdated = (updated: Profile) => {
+    setProfile(updated);
+  };
+
+  const handleProjectUpdated = (proj: Profile["projects"][number]) => {
+    setProfile((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        projects: prev.projects.map((p) => (p.id === proj.id ? { ...p, ...proj } : p)),
+        projectCount: prev.projects.length,
+      };
+    });
+  };
+
+  const handleMediaUpdated = (item: MediaItem) => {
+    setProfile((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        media: prev.media.map((m) => (m.id === item.id ? { ...m, ...item } : m)),
+      };
+    });
+  };
+
   const scrollToTop = () => {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
+
+  useEffect(() => {
+    if (!profile?.id) return;
+    setFooterNote(`Data sourced from ${profile.platforms.join(", ")}.`);
+  }, [profile?.id]);
 
   // Handle scroll for back-to-top button
   useEffect(() => {
@@ -229,6 +261,7 @@ export default function Home() {
               socialLinks={profile.socialLinks}
               profileId={profile.id}
               onImageUpdated={handleProfileImageUpdated}
+              onProfileUpdated={handleProfileUpdated}
             />
             
             <div className="border-t" />
@@ -239,20 +272,26 @@ export default function Home() {
               onPlayVideo={handlePlayVideo}
               profileId={profile.id}
               onCoverUpdated={handleCoverUpdated}
+              onProjectUpdated={handleProjectUpdated}
+              onProfileUpdated={handleProfileUpdated}
             />
             
-            {profile.media.length > 0 && (
-              <>
-                <div className="border-t" />
-                <MediaGallery items={profile.media} title="Videos" />
-              </>
-            )}
+            <div className="border-t" />
+            <MediaGallery
+              items={profile.media}
+              title="Videos"
+              profileId={profile.id}
+              onMediaUpdated={handleMediaUpdated}
+            />
             
             <div className="py-12">
-              <div className="max-w-7xl mx-auto px-6 text-center">
-                <p className="text-sm text-muted-foreground">
-                  Data sourced from {profile.platforms.join(", ")}.
-                </p>
+              <div className="max-w-3xl mx-auto px-6">
+                <Textarea
+                  value={footerNote}
+                  onChange={(e) => setFooterNote(e.target.value)}
+                  className="text-sm text-muted-foreground min-h-[80px] resize-y border-dashed bg-transparent text-center"
+                  aria-label="Footer attribution note"
+                />
               </div>
             </div>
           </>

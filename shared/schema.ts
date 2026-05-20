@@ -4,7 +4,18 @@ import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
 // Platform types for data sources
-export const platformTypes = ["imdb", "tmdb", "omdb", "youtube", "vimeo", "linkedin", "facebook", "website"] as const;
+export const platformTypes = [
+  "imdb",
+  "tmdb",
+  "omdb",
+  "youtube",
+  "vimeo",
+  "linkedin",
+  "facebook",
+  "twitter",
+  "instagram",
+  "website",
+] as const;
 export type Platform = typeof platformTypes[number];
 
 // Users table (kept for auth if needed)
@@ -143,3 +154,39 @@ export const synthesisResultSchema = z.object({
   platforms: z.array(z.enum(platformTypes)),
 });
 export type SynthesisResult = z.infer<typeof synthesisResultSchema>;
+
+/** PATCH /api/profiles/:id — editable header / meta fields */
+export const profileCorePatchSchema = z.object({
+  name: z.string().optional(),
+  role: z.string().optional(),
+  bio: z.string().optional(),
+  yearsActive: z.string().optional(),
+  platforms: z.array(z.enum(platformTypes)).optional(),
+  socialLinks: z.array(socialLinkSchema).optional(),
+  confidence: z.number().min(0).max(1).optional(),
+  projectCount: z.number().optional(),
+});
+export type ProfileCorePatch = z.infer<typeof profileCorePatchSchema>;
+
+/** PATCH /api/profiles/:id/projects/:projectId */
+export const projectFieldsPatchSchema = projectSchema.partial();
+export type ProjectFieldsPatch = z.infer<typeof projectFieldsPatchSchema>;
+
+/** POST /api/profiles/:id/projects — body without id (server assigns) */
+export const projectCreateSchema = z.object({
+  title: z.string().min(1),
+  year: z.string().optional(),
+  role: z.string().optional(),
+  platform: z.enum(platformTypes).optional(),
+  description: z.string().optional(),
+  sourceUrl: z.string().optional(),
+  videoUrl: z.string().optional(),
+  coverImage: z.string().optional(),
+  collaborators: z.array(z.string()).optional(),
+  hasVideo: z.boolean().optional(),
+});
+export type ProjectCreateInput = z.infer<typeof projectCreateSchema>;
+
+/** PATCH /api/profiles/:id/media/:mediaId */
+export const mediaItemPatchSchema = mediaItemSchema.partial();
+export type MediaItemPatch = z.infer<typeof mediaItemPatchSchema>;
